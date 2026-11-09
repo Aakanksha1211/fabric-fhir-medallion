@@ -1,21 +1,16 @@
 # FHIR API Data Ingestion & Analytics — Medallion Lakehouse on Microsoft Fabric
 
-This project pulls public **FHIR R4** healthcare data from a live API and lands it in a
-**Medallion Lakehouse** (Raw → Bronze → Silver → Gold) on Microsoft Fabric. The
-interesting part is that the *same* source serves both JSON and XML, and instead of
-building two pipelines I handle both through one parameterized flow. Along the way it does
-paginated incremental ingestion, keeps metadata and audit logs, tracks history with SCD
-Type 2, orchestrates everything in dependency order, and finishes with a one-page Power BI
-report on the gold layer.
+Ingests public FHIR R4 data into a Medallion Lakehouse (Raw → Bronze → Silver → Gold) on
+Microsoft Fabric. JSON and XML are handled from the same source through one parameterized
+pipeline, with paginated incremental ingestion, metadata/audit logging, SCD Type 2 history,
+pipeline orchestration, and a one-page Power BI report.
 
-A few quick facts to set the scene:
+- **Source:** `https://hapi.fhir.org/baseR4`
+- **Resources:** Patient → Encounter → Observation → Condition (dependency order)
+- **Formats:** JSON and XML, selected at run time via `p_format`
+- **Platform:** Fabric Lakehouse, Spark notebooks, Data Pipelines, Power BI
 
-- **Source:** `https://hapi.fhir.org/baseR4` — the public HAPI FHIR R4 test server (no auth).
-- **Resources:** Patient, Encounter, Observation, Condition — loaded in that order, because the later ones reference the earlier ones.
-- **Formats:** JSON and XML, chosen at run time with a single `p_format` parameter.
-- **Built on:** Fabric Lakehouse, Spark notebooks, Data Pipelines, and Power BI.
-
-## How the data flows
+## Architecture
 
 ```
                  FHIR R4 API (hapi.fhir.org/baseR4)
@@ -45,75 +40,43 @@ A few quick facts to set the scene:
               Power BI — rpt_fhir_analytics (1-page report)
 ```
 
-**Raw** is the landing zone. Every API response is written to OneLake exactly as it came
-back — one file per page, bucketed by resource and ingest date. Nothing is reshaped here,
-which means any layer downstream can be rebuilt from raw without touching the API again.
+- **Raw** — each API response stored as-is, one file per page, bucketed by resource and `ingest_date`. Any layer can be rebuilt from raw without re-calling the API.
+- **Bronze** — files decoded to Delta: JSON via `spark.read.json`, XML via ElementTree with the FHIR namespace. Keeps `resource_payload` plus metadata (`id`, `version_id`, `last_updated`, `extraction_timestamp`, `api_url_or_params`, `run_id`, `ingest_date`).
+- **Silver** — reads `bronze_json_*` and/or `bronze_xml_*`, flattens nested FHIR fields to typed columns, strips reference prefixes (`Patient/123` → `123`), dedups to the latest version, applies SCD Type 2. `source_format` records provenance.
+- **Gold** — star schema (patient dimension + encounter/observation/condition facts) and views, built from `is_current = true` silver.
 
-**Bronze** turns those files into Delta tables. For JSON that's `spark.read.json`; for XML
-it's an ElementTree parse with the FHIR namespace. Each row keeps the original record in a
-`resource_payload` column plus ingestion metadata — the id, version, last-updated
-timestamp, and the API call details joined in from the audit log.
+Control tables: `control_watermark` (high-water mark per resource + format), `control_audit`
+(one row per API call: `extraction_timestamp`, `load_timestamp`, `api_url_or_params`,
+`record_count`, `format`).
 
-**Silver** is where the real transformation happens. It reads whatever bronze tables exist
-(JSON, XML, or both), flattens the nested FHIR fields into clean typed columns, strips
-reference prefixes like `Patient/123` down to the bare id, de-duplicates to the latest
-version of each record, and maintains full history with SCD Type 2. A `source_format`
-column records whether each row originally came from the JSON or the XML path.
+## Format handling
 
-**Gold** is a small star schema built for reporting — a patient dimension, fact tables for
-encounters, observations and conditions, and a couple of views that pre-join the common
-questions. It reads only the current version (`is_current = true`) from silver.
+`p_format` selects the format at run time. Raw switches the `Accept` header and file
+extension; bronze switches the parser. Silver and gold are format-agnostic — running as XML
+is just `p_format = xml`.
 
-Two control tables keep the flow honest: `control_watermark` holds a high-water mark per
-resource and format so each run only pulls what's new, and `control_audit` records one row
-per API call (when it was called, when it was saved, the URL, the record count, and the
-format).
+XML is decoded to columns in **bronze** (deserialization), not in a Dataflow Gen2; silver
+performs the transformation. A single `FLATTEN` spec drives both formats: JSON via
+`get_json_object`, XML via a JSONPath→element-path conversion
+(`$.clinicalStatus.coding[0].code` → `clinicalStatus/coding/code`).
 
-## One source, two formats, one pipeline
+## Load strategy
 
-The same endpoint will hand back JSON or XML depending on the `Accept` header, so it felt
-wrong to maintain two parallel pipelines. Instead format is just a parameter. Raw and
-bronze flip their behaviour on `p_format` — the Accept header and file extension in raw,
-the parser in bronze — and silver and gold don't care about format at all. Running the
-whole thing as XML is nothing more than passing `p_format = xml`.
-
-The one design question worth explaining is *where* the XML gets turned into columns. The
-brief asks for a Dataflow Gen2 that does transformation but not the raw-to-table
-conversion, and FHIR XML (with its namespaces and nested coding arrays) is genuinely
-painful to parse in Power Query anyway. So I draw the line clearly: **bronze decodes the
-format, silver transforms it.** Decoding a serialized payload into columns is
-deserialization, not business logic, so it belongs upstream. And because FHIR's JSON and
-XML are structurally the same shape, I reuse the one `FLATTEN` spec for both — JSON reads
-it through `get_json_object`, and for XML I convert each JSONPath to the equivalent element
-path (`$.clinicalStatus.coding[0].code` becomes `clinicalStatus/coding/code`). One spec,
-both formats, no hardcoding.
-
-## How much gets reloaded each run
-
-The load strategy is deliberately different per layer rather than one blanket approach.
-Ingestion is incremental — each run reads the watermark, asks the API for records with
-`_lastUpdated` at or after it, and appends a new dated partition, so the source is never
-fully re-read. Silver is an incremental upsert: the SCD Type 2 `MERGE` closes rows that
-changed and opens new versions, keeping the whole history. Bronze and gold, by contrast,
-are idempotent full rebuilds — at this data volume, rebuilding them cleanly from the layer
-below is simpler and less error-prone than trying to merge, and the compute saved wouldn't
-be worth the extra complexity. In short, the pipeline is incremental exactly where it
-matters (the API boundary and the history table) and simple everywhere else.
+| Layer | Strategy | Mechanism |
+|-------|----------|-----------|
+| Raw | Incremental | `_lastUpdated >= watermark`; append a new `ingest_date` partition each run |
+| Bronze | Full rebuild | idempotent overwrite from all raw partitions |
+| Silver | Incremental upsert | SCD2 `MERGE` — closes changed rows, inserts new versions, keeps history |
+| Gold | Full rebuild | rebuilt from `is_current = true` silver |
 
 ## Orchestration
 
-Two pipelines handle the scheduling. The child, `pl_fhir_medallion`, runs the four
-notebooks in order — raw, bronze, silver, gold — wired with "on success" dependencies so a
-layer only runs if the previous one worked, and each notebook receives the `p_ingest_date`
-and `p_format` parameters. The parent, `pl_fhir_master`, wraps a `ForEach` over a list of
-dates and invokes the child once per date; because Fabric doesn't allow nested `ForEach`,
-the date loop and the resource chain have to live in separate pipelines. You run the parent
-once for JSON and once for XML. Within each run, the resources go Patient → Encounter →
-Observation → Condition so the foreign keys always resolve.
+- **`pl_fhir_medallion`** (child) — `01 raw → 02 bronze → 03 silver → 04 gold`, wired with "on success" dependencies, each notebook fed `p_ingest_date` and `p_format`.
+- **`pl_fhir_master`** (parent) — `ForEach` over a date array, invoking the child once per date (Fabric cannot nest `ForEach`). Run once per format.
 
-## The data model
+Resources load Patient → Encounter → Observation → Condition so foreign keys resolve.
 
-The gold layer is a straightforward star:
+## Data model
 
 ```
                  ┌───────────────────────┐
@@ -137,58 +100,25 @@ The gold layer is a straightforward star:
 └─────────────────┘ └─────────────────────┘ └─────────────────┘
 ```
 
-Every fact points back to `gold_dim_patient` on `patient_id`, and observations and
-conditions also carry an `encounter_id` back to the encounter fact. The silver tables
-underneath carry the SCD2 machinery — `business_id`, a SHA-256 `record_hash` for change
-detection, the `effective_from` / `effective_to` validity window, and the `is_current`
-flag — so point-in-time history is always available even though gold only shows the present.
+- `gold_fact_*.patient_id` → `gold_dim_patient.patient_id`
+- `gold_fact_observation.encounter_id` / `gold_fact_condition.encounter_id` → `gold_fact_encounter.encounter_id`
+- Silver SCD2 columns: `business_id`, `record_hash` (SHA-256), `effective_from` / `effective_to`, `is_current`.
 
-One honest caveat: on a shared public test server the child resources don't always
-reference the same patients that happened to be paged, so some joins come back sparse. The
-keys and the model are correct; the referential density just depends on what the source
-happens to hold.
+Note: on the shared public test server, child resources do not always reference the paged
+patients, so some joins are sparse — the keys and model are correct, density depends on the
+source data.
 
-## Running it yourself
+## Running it
 
-1. Create a Fabric workspace and Lakehouse, and **pin the Lakehouse as the default** —
-   bare table names in `saveAsTable` won't resolve otherwise. Import the five notebooks.
-2. Build the child pipeline (`pl_fhir_medallion`) as the four-notebook chain, and the
-   parent (`pl_fhir_master`) as a date `ForEach` that invokes the child with
-   `p_ingest_date = @item()`.
-3. Run the parent with `p_format = json`, then again with `p_format = xml`. Silver merges
-   the two and gold rebuilds from the merged result.
+1. Create a Fabric workspace and Lakehouse; pin the Lakehouse as default. Import the five notebooks.
+2. Build the child pipeline (`pl_fhir_medallion`) as the four-notebook chain, and the parent (`pl_fhir_master`) as a date `ForEach` invoking the child with `p_ingest_date = @item()`.
+3. Run the parent with `p_format = json`, then `p_format = xml`. Silver merges both; gold rebuilds from the merged silver.
 4. Build the Power BI report on the gold tables.
 
-To show two or three days of incremental loading, the parent's date array just lists a few
-dates and runs the child once per date. Because the watermark moves forward after every
-run, each dated partition is a genuinely new slice rather than a re-pull of the same data.
+## Report
 
-A couple of Fabric-specific things worth knowing if you're reproducing it: each notebook's
-first cell is a parameters cell (`ingest_date`, `data_format`), and `%run 00_config` has to
-sit alone in its own cell. One small but real gotcha in the XML bronze path is that I
-declare an explicit `StringType` schema — without it, a column that happens to be all-null
-for a resource infers as `NullType` and the Delta write fails.
-
-## What the assignment asked for
-
-- [x] Incremental ingestion with pagination, demonstrated across 2–3 days
-- [x] Raw responses stored as-is, then converted to Delta tables
-- [x] Metadata columns (`extraction_timestamp`, `api_url_or_params`)
-- [x] Versioning — when called / when saved — plus SCD Type 2 history
-- [x] Full medallion: Raw → Bronze → Silver → Gold
-- [x] Silver cleaning and dedup; gold warehouse views
-- [x] Orchestration in dependency order (parent + child pipelines)
-- [x] Modular, config-driven code with no hardcoding
-- [x] Documentation of the pipeline and table relationships
-- [x] XML variant through the same pipeline (`p_format = xml`)
-- [x] One-page Power BI report on the gold layer
-
-## The report
-
-The report, `rpt_fhir_analytics`, sits on top of the gold model. It opens with count cards
-for patients, conditions and observations, then breaks patients down by gender, shows the
-most common conditions and encounters by class, and lists patient detail — so all four FHIR
-resources are represented at a glance.
+`rpt_fhir_analytics`, on the gold model: count cards (patients, conditions, observations),
+patients by gender, top conditions, encounters by class, and a patient detail table.
 
 <img width="1163" height="646" alt="FHIR analytics report — cards, gender donut, conditions and encounters" src="https://github.com/user-attachments/assets/1388aad9-76c9-4628-9c13-3a04d401005c" />
 
